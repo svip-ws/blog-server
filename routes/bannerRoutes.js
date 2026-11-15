@@ -3,6 +3,16 @@ const router = express.Router();
 const bannerController = require("../controllers/bannerController");
 const authMiddleware = require("../middlewares/authMiddleware");
 const adminMiddleware = require("../middlewares/adminMiddleware");
+const upload = require("../middlewares/upload");
+
+// 轮播图媒体文件上传（图片/视频，前端字段名 image）
+router.post(
+  "/upload",
+  authMiddleware,
+  adminMiddleware,
+  upload.mediaMemory.single("image"),
+  bannerController.uploadBanner
+);
 
 // 公开接口
 router.get("/active", bannerController.getActiveBanners);

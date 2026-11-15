@@ -1,79 +1,40 @@
 const express = require("express");
 const router = express.Router();
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const messageController = require("../controllers/messageController");
 const authMiddleware = require("../middlewares/authMiddleware");
+const optionalAuthMiddleware = require("../middlewares/optionalAuthMiddleware");
+
 const adminMiddleware = require("../middlewares/adminMiddleware");
+const { messageLimiter } = require("../middlewares/rateLimitMiddleware");
 
-// 图片上传配置
-const uploadDir = path.join(__dirname, "../uploads/messages");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// ================= 管理端接口 (需管理员权限) =================
+// 注意：静态 admin 路由必须放在动态 /:id 路由之前，避免被误匹配为 id="admin"
+router.get("/admin/list", authMiddleware, adminMiddleware, messageController.getAdminMessageList);
+router.get("/admin/export", authMiddleware, adminMiddleware, messageController.exportAdminMessages);
+router.post("/admin/batch", authMiddleware, adminMiddleware, messageController.batchAdminMessages);
+router.get("/admin/replies/:messageId", authMiddleware, adminMiddleware, messageController.getAdminReplies);
+router.post("/admin/replies/:messageId", authMiddleware, adminMiddleware, messageController.adminReplyMessage);
+router.delete("/admin/reply/:id", authMiddleware, adminMiddleware, messageController.deleteAdminReply);
+router.put("/admin/:id/status", authMiddleware, adminMiddleware, messageController.updateAdminMessageStatus);
+router.delete("/admin/:id", authMiddleware, adminMiddleware, messageController.deleteAdminMessage);
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(
-      null,
-      `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`,
-    );
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) cb(null, true);
-    else cb(new Error("只支持 jpg/png/gif/webp 格式"));
-  },
-});
-
-// 公开接口
+// ================= 客户端公开接口 =================
+// 获取展示中的留言列表（全公开）
 router.get("/active", messageController.getActiveMessages);
 
-// 需要登录
-router.post("/", authMiddleware, messageController.createMessage);
-router.post("/:id/like", authMiddleware, messageController.likeMessage);
-router.post("/:id/reply", authMiddleware, messageController.replyMessage);
-router.post(
-  "/upload",
-  authMiddleware,
-  upload.single("image"),
-  messageController.uploadImage,
-);
-router.get("/liked", authMiddleware, messageController.getLikedStatus);
+// 发表留言（支持游客 + 已登录用户，限流 + 敏感词）
+router.post("/", messageLimiter, optionalAuthMiddleware, messageController.createMessage);
 
-// 管理员接口
-router.get(
-  "/",
-  authMiddleware,
-  adminMiddleware,
-  messageController.getAllMessages,
-);
-router.get(
-  "/:id",
-  authMiddleware,
-  adminMiddleware,
-  messageController.getMessageById,
-);
-router.put(
-  "/:id",
-  authMiddleware,
-  adminMiddleware,
-  messageController.updateMessage,
-);
-router.delete(
-  "/:id",
-  authMiddleware,
-  adminMiddleware,
-  messageController.deleteMessage,
-);
+// 点赞留言（支持游客 IP 去重与已登录用户账号绑定，支持 toggle 点赞/取消）
+router.post("/:id/like", optionalAuthMiddleware, messageController.likeMessage);
+
+// 回复留言（支持游客 + 已登录用户，限流 + 敏感词）
+router.post("/:id/reply", messageLimiter, optionalAuthMiddleware, messageController.replyMessage);
+
+// 获取用户点赞状态（支持登录用户及游客）
+router.get("/liked", optionalAuthMiddleware, messageController.getLikedStatus);
+
+// 删除自己的留言（仅登录用户，且只能删自己发的）
+router.delete("/:id", optionalAuthMiddleware, messageController.deleteOwnMessage);
 
 module.exports = router;

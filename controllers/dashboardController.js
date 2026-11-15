@@ -82,19 +82,24 @@ exports.getViewTrend = async (req, res) => {
     `;
     const [rows] = await db.query(sql);
 
-    // 补全7天数据
+    // 补全7天数据（使用本地年月日口径，避免 UTC toISOString 在 00:00~08:00 跨日偏移）
+    const toLocalDateStr = (d) => {
+      const dt = new Date(d);
+      const y = dt.getFullYear();
+      const m = String(dt.getMonth() + 1).padStart(2, "0");
+      const day = String(dt.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+
     const result = [];
     for (let i = 6; i >= 0; i--) {
       const date = new Date();
       date.setDate(date.getDate() - i);
-      const dateStr = date.toISOString().split("T")[0];
-      const found = rows.find((r) => {
-        const rDate = new Date(r.date).toISOString().split("T")[0];
-        return rDate === dateStr;
-      });
+      const dateStr = toLocalDateStr(date);
+      const found = rows.find((r) => toLocalDateStr(r.date) === dateStr);
       result.push({
         date: `${date.getMonth() + 1}/${date.getDate()}`,
-        views: found ? found.views : 0,
+        views: found ? Number(found.views) || 0 : 0,
       });
     }
 

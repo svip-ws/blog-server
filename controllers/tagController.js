@@ -1,21 +1,42 @@
 const db = require("../config/db");
+const { sanitizeName } = require("../utils/sanitizeName");
+const cache = require("../utils/cache");
+const storage = require("../services/storage");
+
+// 标签封面 cover → cover_url
+const TAG_FIELDS = { cover: "cover_url" };
+// 标签下文章列表：文章封面 + 作者头像
+const TAG_ARTICLE_FIELDS = { cover: "cover_url", author_avatar: "author_avatar_url" };
 
 // 1. 获取所有标签（含文章数量统计）
 exports.getAllTags = async (req, res) => {
   try {
+    const cacheKey = "all_tags";
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      return res.json({
+        code: 200,
+        message: "获取成功(缓存)",
+        data: cachedData.map((t) => storage.attachUrls({ ...t }, TAG_FIELDS)),
+      });
+    }
+
     const sql = `
-      SELECT t.*, COUNT(at2.article_id) AS article_count
+      SELECT t.id, t.name, t.cover, t.create_time, COUNT(DISTINCT a.id) AS article_count
       FROM tag t
       LEFT JOIN article_tag at2 ON t.id = at2.tag_id
-      GROUP BY t.id
+      LEFT JOIN article a ON at2.article_id = a.id AND a.status = 1
+      GROUP BY t.id, t.name, t.cover, t.create_time
       ORDER BY t.create_time DESC
     `;
     const [tags] = await db.query(sql);
 
+    cache.set(cacheKey, tags, 60000); // 缓存 60s（只存原始 key）
+
     res.json({
       code: 200,
       message: "获取成功",
-      data: tags,
+      data: tags.map((t) => storage.attachUrls({ ...t }, TAG_FIELDS)),
     });
   } catch (error) {
     console.error("获取标签列表错误:", error);
@@ -37,7 +58,7 @@ exports.getTagById = async (req, res) => {
     res.json({
       code: 200,
       message: "获取成功",
-      data: tags[0],
+      data: storage.attachUrls({ ...tags[0] }, TAG_FIELDS),
     });
   } catch (error) {
     console.error("获取标签详情错误:", error);
@@ -47,22 +68,27 @@ exports.getTagById = async (req, res) => {
 
 // 3. 新增标签
 exports.createTag = async (req, res) => {
-  const { name } = req.body;
+  const name = sanitizeName(req.body.name);
+  const cover = req.body.cover || req.body.bg_image || null;
 
   if (!name) {
     return res.status(400).json({ code: 400, message: "标签名不能为空" });
   }
 
   try {
-    const [existing] = await db.query("SELECT id FROM tag WHERE name = ?", [
-      name,
-    ]);
+    const [existing] = await db.query(
+      "SELECT id FROM tag WHERE LOWER(TRIM(name)) = LOWER(?)",
+      [name],
+    );
 
     if (existing.length > 0) {
       return res.status(400).json({ code: 400, message: "标签名已存在" });
     }
 
-    await db.query("INSERT INTO tag (name) VALUES (?)", [name]);
+    await db.query("INSERT INTO tag (name, cover) VALUES (?, ?)", [name, cover]);
+    cache.delete("all_tags");
+    cache.delete("site_stats_summary");
+    cache.delete("home_bootstrap");
 
     res.status(201).json({
       code: 201,
@@ -77,7 +103,8 @@ exports.createTag = async (req, res) => {
 // 4. 更新标签
 exports.updateTag = async (req, res) => {
   const { id } = req.params;
-  const { name } = req.body;
+  const name = sanitizeName(req.body.name);
+  const cover = req.body.cover !== undefined ? req.body.cover : (req.body.bg_image || null);
 
   if (!name) {
     return res.status(400).json({ code: 400, message: "标签名不能为空" });
@@ -91,7 +118,7 @@ exports.updateTag = async (req, res) => {
     }
 
     const [duplicate] = await db.query(
-      "SELECT id FROM tag WHERE name = ? AND id != ?",
+      "SELECT id FROM tag WHERE LOWER(TRIM(name)) = LOWER(?) AND id != ?",
       [name, id],
     );
 
@@ -99,7 +126,10 @@ exports.updateTag = async (req, res) => {
       return res.status(400).json({ code: 400, message: "标签名已存在" });
     }
 
-    await db.query("UPDATE tag SET name = ? WHERE id = ?", [name, id]);
+    await db.query("UPDATE tag SET name = ?, cover = ? WHERE id = ?", [name, cover, id]);
+    cache.delete("all_tags");
+    cache.delete("home_bootstrap");
+    cache.flushPattern("article_list_");
 
     res.json({
       code: 200,
@@ -123,6 +153,10 @@ exports.deleteTag = async (req, res) => {
     }
 
     await db.query("DELETE FROM tag WHERE id = ?", [id]);
+    cache.delete("all_tags");
+    cache.delete("site_stats_summary");
+    cache.delete("home_bootstrap");
+    cache.flushPattern("article_list_");
 
     res.json({
       code: 200,
@@ -154,7 +188,7 @@ exports.getArticlesByTag = async (req, res) => {
     res.json({
       code: 200,
       message: "获取成功",
-      data: articles,
+      data: articles.map((a) => storage.attachUrls({ ...a }, TAG_ARTICLE_FIELDS)),
     });
   } catch (error) {
     console.error("按标签获取文章错误:", error);

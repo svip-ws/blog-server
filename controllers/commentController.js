@@ -1,51 +1,191 @@
 const db = require("../config/db");
+const cache = require("../utils/cache");
+const { cleanPlainText } = require("../utils/sanitizeHtml");
+const storage = require("../services/storage");
+const { getClientIp } = require("../utils/clientIp");
+const { isAdmin } = require("../utils/role");
 
-// 1. 发表评论 / 回复 (受保护接口)
+async function deleteCommentSubtree(conn, rootId) {
+  const toDelete = [Number(rootId)];
+  let frontier = [Number(rootId)];
+  while (frontier.length > 0) {
+    const [children] = await conn.query(
+      "SELECT id FROM comment WHERE parent_id IN (?)",
+      [frontier]
+    );
+    if (!children || children.length === 0) break;
+    const nextIds = children.map((c) => Number(c.id)).filter((cid) => !toDelete.includes(cid));
+    if (nextIds.length === 0) break;
+    toDelete.push(...nextIds);
+    frontier = nextIds;
+  }
+  await conn.query("DELETE FROM comment_like WHERE comment_id IN (?)", [toDelete]).catch(() => {});
+  await conn.query("DELETE FROM comment WHERE id IN (?)", [toDelete]);
+}
+
+// 辅助函数：修复 HTTP Avatar 导致浏览器 Mixed Content 拦截图片
+const fixAvatarUrl = (url) => {
+  if (!url) return "";
+  if (url.startsWith("http://hxiuji.top")) {
+    return url.replace("http://hxiuji.top", "https://hxiuji.top");
+  }
+  return url;
+};
+
+const DEFAULT_AVATAR = "https://cube.elemecdn.com/3/7c/3ea6beec64369c2642b92c6726f1epng.png";
+
+// 解析评论头像：旧 http 外链先转 https → key/外链统一签名 → 空值兜底默认头像
+const resolveAvatar = (url) => storage.sign(fixAvatarUrl(url)) || DEFAULT_AVATAR;
+
+/**
+ * 1. 发表评论 / 回复（全透明支持：游客免登录发表 + 已登录用户发表）
+ */
 exports.createComment = async (req, res) => {
-  const { article_id, parent_id, reply_to_user_id, content } = req.body;
-  const user_id = req.user.id; // 从第一阶段写的 authMiddleware 鉴权锁中动态切出当前登录用户ID
+  const { article_id, parent_id, reply_to_user_id, content, guest_name, reply_to_name } = req.body;
 
-  if (!content || !article_id) {
-    return res
-      .status(400)
-      .json({ code: 400, message: "文章ID和评论内容不能为空" });
+  if (!content || !content.trim() || !article_id) {
+    return res.status(400).json({ code: 400, message: "文章ID和评论内容不能为空" });
   }
 
+  // 服务端输入校验与安全净化（纵深防御，彻底杜绝 XSS）
+  const commentContent = cleanPlainText(content).trim();
+  if (!commentContent) {
+    return res.status(400).json({ code: 400, message: "评论内容不能为空或包含非法字符" });
+  }
+  if (commentContent.length > 2000) {
+    return res.status(400).json({ code: 400, message: "评论内容不能超过 2000 字" });
+  }
+  const safeGuestName = guest_name && String(guest_name).trim()
+    ? cleanPlainText(String(guest_name)).trim().slice(0, 64)
+    : "热心网友";
+  const safeReplyToName = reply_to_name && String(reply_to_name).trim()
+    ? cleanPlainText(String(reply_to_name)).trim().slice(0, 64)
+    : null;
+
+  const user_id = req.user ? req.user.id : null;
+  const authorName = req.user
+    ? (req.user.nickname || req.user.username || "热心网友")
+    : safeGuestName;
+
+  let conn;
   try {
-    const sql = `
-      INSERT INTO comment (article_id, user_id, parent_id, reply_to_user_id, content)
-      VALUES (?, ?, ?, ?, ?)
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    // 校验文章存在且已发布（行锁防止并发写计数时读-改-写漂移）
+    const [articles] = await conn.query(
+      "SELECT id FROM article WHERE id = ? AND status = 1 FOR UPDATE",
+      [article_id],
+    );
+    if (articles.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ code: 404, message: "文章不存在或已被删除" });
+    }
+
+    // 校验父评论存在且归属同一文章，保证回复树结构不跨文章
+    let resolvedParentId = parent_id || null;
+    if (resolvedParentId) {
+      const [parents] = await conn.query(
+        "SELECT id, article_id FROM comment WHERE id = ?",
+        [resolvedParentId],
+      );
+      if (parents.length === 0 || parents[0].article_id !== Number(article_id)) {
+        await conn.rollback();
+        return res.status(400).json({ code: 400, message: "回复的评论不存在或不属于该文章" });
+      }
+    }
+
+    const insertSql = `
+      INSERT INTO comment (article_id, user_id, parent_id, reply_to_user_id, content, guest_name, guest_reply_to)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `;
-    // 【异步等待①】：执行磁盘插入
-    const [result] = await db.query(sql, [
+    const [result] = await conn.query(insertSql, [
       article_id,
       user_id,
-      parent_id || null,
+      resolvedParentId,
       reply_to_user_id || null,
-      content,
+      commentContent,
+      authorName,
+      safeReplyToName,
     ]);
+
+    // 同步更新文章评论总数
+    const [countRows] = await conn.query(
+      "SELECT COUNT(*) AS cnt FROM comment WHERE article_id = ?",
+      [article_id],
+    );
+    await conn.query(
+      "UPDATE article SET comment_count = ? WHERE id = ?",
+      [countRows[0].cnt, article_id],
+    );
+
+    // 读回刚插入的完整评论（含服务端生成时间、关联昵称/头像），供前端即时插入无需整表重载
+    const [rows] = await conn.query(
+      `SELECT c.id, c.article_id, c.user_id, c.parent_id, c.reply_to_user_id,
+              c.content, c.like_count, c.create_time,
+              COALESCE(u.nickname, u.username, c.guest_name, '热心网友') AS user_name,
+              COALESCE(u.avatar, ?) AS user_avatar,
+              COALESCE(ru.nickname, ru.username, c.guest_reply_to, '热心网友') AS reply_to_user_name
+       FROM comment c
+       LEFT JOIN user u ON c.user_id = u.id
+       LEFT JOIN user ru ON c.reply_to_user_id = ru.id
+       WHERE c.id = ?`,
+      [DEFAULT_AVATAR, result.insertId],
+    );
+
+    const newComment = rows[0];
+    newComment.user_avatar = resolveAvatar(newComment.user_avatar);
+    newComment.replies = [];
+
+    await conn.commit();
+    cache.flushPattern("latest_comments_");
+    cache.delete("site_stats_summary");
+    cache.delete("home_bootstrap");
 
     res.status(201).json({
       code: 201,
       message: "评论发表成功",
-      data: { commentId: result.insertId },
+      data: { comment: newComment, comment_count: countRows[0].cnt },
     });
   } catch (error) {
+    if (conn) {
+      try { await conn.rollback(); } catch (_) {}
+    }
     console.error("发表评论错误:", error);
     res.status(500).json({ code: 500, message: "服务器内部错误" });
+  } finally {
+    if (conn) conn.release();
   }
 };
 
-// 2. 获取某篇文章的评论树状列表 (公开接口)
+/**
+ * 2. 获取某篇文章的全部评论（全公开无需登录：组装为树状图 + 兼容双模式结构）
+ */
 exports.getCommentsByArticle = async (req, res) => {
   const { articleId } = req.params;
 
   try {
-    // 【异步等待②】：多表联查，一次性把评论内容、评论者昵称/头像、被回复者昵称全部拉出来
+    const [articles] = await db.query(
+      "SELECT id, user_id, status FROM article WHERE id = ?",
+      [articleId]
+    );
+    if (articles.length === 0) {
+      return res.status(404).json({ code: 404, message: "文章不存在或已被删除" });
+    }
+    const art = articles[0];
+    if (art.status !== 1) {
+      const canPreview = req.user && (req.user.id === art.user_id || isAdmin(req.user.role));
+      if (!canPreview) {
+        return res.status(404).json({ code: 404, message: "文章不存在或已被删除" });
+      }
+    }
+
     const sql = `
-      SELECT c.*, 
-             u.nickname AS user_name, u.avatar AS user_avatar,
-             ru.nickname AS reply_to_user_name
+      SELECT c.id, c.article_id, c.user_id, c.parent_id, c.reply_to_user_id, 
+             c.content, c.like_count, c.create_time,
+             COALESCE(u.nickname, u.username, c.guest_name, '热心网友') AS user_name,
+             COALESCE(u.avatar, '${DEFAULT_AVATAR}') AS user_avatar,
+             COALESCE(ru.nickname, ru.username, c.guest_reply_to, '热心网友') AS reply_to_user_name
       FROM comment c
       LEFT JOIN user u ON c.user_id = u.id
       LEFT JOIN user ru ON c.reply_to_user_id = ru.id
@@ -54,45 +194,202 @@ exports.getCommentsByArticle = async (req, res) => {
     `;
     const [allComments] = await db.query(sql, [articleId]);
 
-    // ==================== 核心算法：将一维数组重组为树状父子结构 ====================
     const commentMap = {};
     const rootComments = [];
 
-    // 1. 先建立扁平映射字典
-    allComments.forEach((comment) => {
-      comment.replies = []; // 预留子回复数组容器
-      commentMap[comment.id] = comment;
+    // 初始化字典与容器，修复头像 HTTPS 及空值保底
+    allComments.forEach((c) => {
+      c.replies = [];
+      c.user_name = c.user_name || "热心网友";
+      c.user_avatar = resolveAvatar(c.user_avatar);
+      commentMap[c.id] = c;
     });
 
-    // 2. 扫描归类
-    allComments.forEach((comment) => {
-      if (comment.parent_id === null) {
-        // 是一级评论，直接推入根节点
-        rootComments.push(comment);
+    // 递归组装顶级评论与多级回复
+    allComments.forEach((c) => {
+      if (!c.parent_id || c.parent_id === 0) {
+        rootComments.push(c);
       } else {
-        // 是二级/多级回复，找到它的物理父级评论，塞进父级的 replies 数组里
-        const parent = commentMap[comment.parent_id];
+        const parent = commentMap[c.parent_id];
         if (parent) {
-          parent.replies.push(comment);
+          parent.replies.push(c);
+        } else {
+          rootComments.push(c);
         }
       }
     });
 
+    // 创建双重兼容数组响应体 (兼顾旧版客户端把 res.data 视作 Array，及新版视作 {list, total})
+    const responseData = [...rootComments];
+    responseData.list = rootComments;
+    responseData.total = allComments.length;
+
     res.json({
       code: 200,
       message: "获取评论成功",
-      data: rootComments, // 只返回组装好子孙节点的顶级评论树
+      data: responseData,
     });
   } catch (error) {
-    console.error("获取评论树错误:", error);
+    console.error("获取评论列表错误:", error);
     res.status(500).json({ code: 500, message: "服务器内部错误" });
   }
 };
 
-// 获取最新评论（公开，首页用）
+exports.likeComment = async (req, res) => {
+  const { id } = req.params;
+  if (!id || isNaN(Number(id))) {
+    return res.status(400).json({ code: 400, message: "评论ID不合法" });
+  }
+
+  const userId = req.user ? req.user.id : null;
+  const clientIp = getClientIp(req);
+
+  let conn;
+  try {
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [comments] = await conn.query(
+      "SELECT id FROM comment WHERE id = ? FOR UPDATE",
+      [id]
+    );
+    if (!comments || comments.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ code: 404, message: "评论不存在或已被删除" });
+    }
+
+    let existing = [];
+    if (userId) {
+      [existing] = await conn.query(
+        "SELECT id FROM comment_like WHERE comment_id = ? AND user_id = ? FOR UPDATE",
+        [id, userId]
+      );
+    } else {
+      [existing] = await conn.query(
+        "SELECT id FROM comment_like WHERE comment_id = ? AND ip = ? FOR UPDATE",
+        [id, clientIp]
+      );
+    }
+
+    let liked = false;
+    if (existing && existing.length > 0) {
+      if (userId) {
+        await conn.query(
+          "DELETE FROM comment_like WHERE comment_id = ? AND user_id = ?",
+          [id, userId]
+        );
+      } else {
+        await conn.query(
+          "DELETE FROM comment_like WHERE comment_id = ? AND ip = ?",
+          [id, clientIp]
+        );
+      }
+      liked = false;
+    } else {
+      await conn.query(
+        "INSERT INTO comment_like (comment_id, user_id, ip) VALUES (?, ?, ?)",
+        [id, userId, clientIp]
+      );
+      liked = true;
+    }
+
+    const [countRows] = await conn.query(
+      "SELECT COUNT(*) AS cnt FROM comment_like WHERE comment_id = ?",
+      [id]
+    );
+    const like_count = countRows[0].cnt;
+    await conn.query(
+      "UPDATE comment SET like_count = ? WHERE id = ?",
+      [like_count, id]
+    );
+
+    await conn.commit();
+    res.json({
+      code: 200,
+      message: liked ? "点赞成功" : "取消点赞",
+      data: { liked, like_count }
+    });
+  } catch (error) {
+    if (conn) {
+      try { await conn.rollback(); } catch (_) {}
+    }
+    console.error("评论点赞错误:", error);
+    res.status(500).json({ code: 500, message: "服务器内部错误" });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+/**
+ * 4. 用户删除自己的评论
+ */
+exports.deleteUserComment = async (req, res) => {
+  const { id } = req.params;
+  const user_id = req.user.id;
+
+  let conn;
+  try {
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [comments] = await conn.query(
+      "SELECT user_id, article_id FROM comment WHERE id = ? FOR UPDATE",
+      [id],
+    );
+    if (comments.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ code: 404, message: "评论不存在" });
+    }
+
+    if (comments[0].user_id !== user_id) {
+      await conn.rollback();
+      return res.status(403).json({ code: 403, message: "无权删除他人的评论" });
+    }
+
+    const articleId = comments[0].article_id;
+
+    await deleteCommentSubtree(conn, id);
+
+    const [countRows] = await conn.query(
+      "SELECT COUNT(*) AS cnt FROM comment WHERE article_id = ?",
+      [articleId],
+    );
+    await conn.query(
+      "UPDATE article SET comment_count = ? WHERE id = ?",
+      [countRows[0].cnt, articleId],
+    );
+
+    await conn.commit();
+    cache.flushPattern("latest_comments_");
+    cache.delete("site_stats_summary");
+    cache.delete("home_bootstrap");
+    res.json({
+      code: 200,
+      message: "评论已成功删除",
+      data: { comment_count: countRows[0].cnt },
+    });
+  } catch (error) {
+    if (conn) {
+      try { await conn.rollback(); } catch (_) {}
+    }
+    console.error("删除评论错误:", error);
+    res.status(500).json({ code: 500, message: "服务器内部错误" });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+/**
+ * 5. 获取最新评论 (首页展示)
+ */
 exports.getLatestComments = async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 8;
+    const cacheKey = `latest_comments_${limit}`;
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      return res.json({ code: 200, message: "获取成功(缓存)", data: cachedData });
+    }
 
     const sql = `
       SELECT c.id, c.content, c.create_time,
@@ -105,6 +402,9 @@ exports.getLatestComments = async (req, res) => {
       LIMIT ?
     `;
     const [comments] = await db.query(sql, [limit]);
+    comments.forEach(c => { c.user_avatar = resolveAvatar(c.user_avatar); });
+
+    cache.set(cacheKey, comments, 20000); // 缓存 20 秒
 
     res.json({ code: 200, message: "获取成功", data: comments });
   } catch (error) {
@@ -113,11 +413,13 @@ exports.getLatestComments = async (req, res) => {
   }
 };
 
-// 获取所有评论列表（管理端，分页 + 筛选）
+/**
+ * 6. 管理端：获取评论列表
+ */
 exports.getCommentList = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const pageSize = parseInt(req.query.pageSize) || 10;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 10));
     const articleTitle = req.query.article_title;
     const userName = req.query.user_name;
     const offset = (page - 1) * pageSize;
@@ -165,16 +467,11 @@ exports.getCommentList = async (req, res) => {
 
     const total = countResult[0][0].total;
 
-    const comments = listResult[0].map((item) => ({
-      ...item,
-      is_reply: item.parent_id !== null && item.parent_id !== 0,
-    }));
-
     res.json({
       code: 200,
       message: "获取成功",
       data: {
-        list: comments,
+        list: listResult[0],
         total: total,
         page: page,
         pageSize: pageSize,
@@ -182,12 +479,14 @@ exports.getCommentList = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("获取评论列表错误:", error);
+    console.error("获取管理端评论列表错误:", error);
     res.status(500).json({ code: 500, message: "服务器内部错误" });
   }
 };
 
-// 获取单条评论详情（管理端）
+/**
+ * 7. 管理端：获取单条评论详情
+ */
 exports.getCommentById = async (req, res) => {
   const { id } = req.params;
   try {
@@ -206,38 +505,60 @@ exports.getCommentById = async (req, res) => {
       return res.status(404).json({ code: 404, message: "评论不存在" });
     }
 
-    const comment = comments[0];
-    if (comment.parent_id) {
-      const [parents] = await db.query(
-        "SELECT id, content FROM comment WHERE id = ?",
-        [comment.parent_id],
-      );
-      comment.parent_content =
-        parents.length > 0 ? parents[0].content : "已删除";
-    }
-
-    res.json({ code: 200, message: "获取成功", data: comment });
+    res.json({ code: 200, message: "获取成功", data: comments[0] });
   } catch (error) {
     console.error("获取评论详情错误:", error);
     res.status(500).json({ code: 500, message: "服务器内部错误" });
   }
 };
 
-// 删除评论（管理端，含子评论一并删除）
+/**
+ * 8. 管理端：删除评论
+ */
 exports.adminDeleteComment = async (req, res) => {
   const { id } = req.params;
+  let conn;
   try {
-    await db.query("DELETE FROM comment WHERE parent_id = ?", [id]);
+    conn = await db.getConnection();
+    await conn.beginTransaction();
 
-    const [result] = await db.query("DELETE FROM comment WHERE id = ?", [id]);
-
-    if (result.affectedRows === 0) {
+    const [comments] = await conn.query(
+      "SELECT article_id FROM comment WHERE id = ? FOR UPDATE",
+      [id],
+    );
+    if (comments.length === 0) {
+      await conn.rollback();
       return res.status(404).json({ code: 404, message: "评论不存在" });
     }
+    const articleId = comments[0].article_id;
 
-    res.json({ code: 200, message: "评论删除成功" });
+    await deleteCommentSubtree(conn, id);
+
+    const [countRows] = await conn.query(
+      "SELECT COUNT(*) AS cnt FROM comment WHERE article_id = ?",
+      [articleId],
+    );
+    await conn.query(
+      "UPDATE article SET comment_count = ? WHERE id = ?",
+      [countRows[0].cnt, articleId],
+    );
+
+    await conn.commit();
+    cache.flushPattern("latest_comments_");
+    cache.delete("site_stats_summary");
+    cache.delete("home_bootstrap");
+    res.json({
+      code: 200,
+      message: "评论已成功删除",
+      data: { comment_count: countRows[0].cnt },
+    });
   } catch (error) {
+    if (conn) {
+      try { await conn.rollback(); } catch (_) {}
+    }
     console.error("删除评论错误:", error);
     res.status(500).json({ code: 500, message: "服务器内部错误" });
+  } finally {
+    if (conn) conn.release();
   }
 };

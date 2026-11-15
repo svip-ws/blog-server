@@ -2,16 +2,10 @@ const express = require("express");
 const router = express.Router();
 const commentController = require("../controllers/commentController");
 const authMiddleware = require("../middlewares/authMiddleware");
+const optionalAuthMiddleware = require("../middlewares/optionalAuthMiddleware");
 const adminMiddleware = require("../middlewares/adminMiddleware");
 
-// 公开接口
-router.get("/latest", commentController.getLatestComments);
-
-// 需要登录
-router.post("/", authMiddleware, commentController.createComment);
-router.get("/:articleId", commentController.getCommentsByArticle);
-
-// 管理员接口
+// 1. 管理端路由（高优先级，避免与 /:articleId 混淆）
 router.get(
   "/admin/list",
   authMiddleware,
@@ -30,5 +24,14 @@ router.delete(
   adminMiddleware,
   commentController.adminDeleteComment,
 );
+
+// 2. 公开只读路由
+router.get("/latest", commentController.getLatestComments);
+router.get("/:articleId", optionalAuthMiddleware, commentController.getCommentsByArticle);
+
+// 3. 互动路由 (发表评论支持全网游客/登录用户柔性发表)
+router.post("/", optionalAuthMiddleware, commentController.createComment);
+router.post("/:id/like", optionalAuthMiddleware, commentController.likeComment);
+router.delete("/:id", authMiddleware, commentController.deleteUserComment);
 
 module.exports = router;

@@ -1,28 +1,35 @@
 {
-  "name": "blog-server",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon index.js",
-    "start": "node index.js"
-  },
-  "author": "WangShuai",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "@wangeditor/editor": "^5.1.23",
-    "@wangeditor/editor-for-vue": "^1.0.2",
-    "bcryptjs": "^3.0.3",
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "jsonwebtoken": "^9.0.3",
-    "multer": "^2.2.0",
-    "mysql2": "^3.22.5",
-    "sharp": "^0.35.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.14"
-  }
+    "name": "blog-server",
+    "version": "1.0.0",
+    "main": "index.js",
+    "scripts": {
+        "test": "node --test tests/*.test.js",
+        "dev": "nodemon index.js",
+        "start": "node index.js"
+    },
+    "author": "WangShuai",
+    "license": "ISC",
+    "description": "",
+    "dependencies": {
+        "bcryptjs": "^3.0.3",
+        "cheerio": "^1.2.0",
+        "compression": "^1.8.1",
+        "cors": "^2.8.6",
+        "cos-nodejs-sdk-v5": "^3.0.0",
+        "dotenv": "^17.4.2",
+        "express": "^5.2.1",
+        "express-rate-limit": "^7.5.1",
+        "helmet": "^7.2.0",
+        "jsonwebtoken": "^9.0.3",
+        "mammoth": "^1.12.3",
+        "multer": "^2.4.0",
+        "mysql2": "^3.24.4",
+        "pdf-parse": "^2.4.5",
+        "sanitize-html": "^2.18.0",
+        "sharp": "^0.35.4",
+        "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+    },
+    "devDependencies": {
+        "nodemon": "^3.1.14"
+    }
 }
